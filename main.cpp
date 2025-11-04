@@ -3,6 +3,8 @@
 #include <cstring>
 #include <vector>
 #include <algorithm>
+#include <map>
+#include <set>
 
 using namespace std;
 
@@ -26,105 +28,176 @@ struct Entry {
 
 class FileDB {
 private:
-    fstream dataFile;
+    // In-memory index: key -> set of (value, file_position)
+    map<string, set<pair<int, long>>> index;
+    long nextPos;
 
-    void openDataFile() {
-        dataFile.open(DATA_FILE, ios::in | ios::out | ios::binary);
-        if (!dataFile.is_open()) {
-            // File doesn't exist, create it
-            dataFile.open(DATA_FILE, ios::out | ios::binary);
-            dataFile.close();
-            dataFile.open(DATA_FILE, ios::in | ios::out | ios::binary);
+    void loadIndex() {
+        ifstream indexFile(INDEX_FILE, ios::binary);
+        if (!indexFile.is_open()) {
+            // No index file yet
+            nextPos = 0;
+            return;
         }
+
+        // Read index from file
+        size_t mapSize;
+        indexFile.read((char*)&mapSize, sizeof(mapSize));
+
+        for (size_t i = 0; i < mapSize; i++) {
+            size_t keyLen;
+            indexFile.read((char*)&keyLen, sizeof(keyLen));
+
+            string key;
+            key.resize(keyLen);
+            indexFile.read(&key[0], keyLen);
+
+            size_t setSize;
+            indexFile.read((char*)&setSize, sizeof(setSize));
+
+            set<pair<int, long>> values;
+            for (size_t j = 0; j < setSize; j++) {
+                int value;
+                long pos;
+                indexFile.read((char*)&value, sizeof(value));
+                indexFile.read((char*)&pos, sizeof(pos));
+                values.insert({value, pos});
+            }
+
+            index[key] = values;
+        }
+
+        indexFile.read((char*)&nextPos, sizeof(nextPos));
+        indexFile.close();
     }
 
-    void closeDataFile() {
-        if (dataFile.is_open()) {
-            dataFile.close();
+    void saveIndex() {
+        ofstream indexFile(INDEX_FILE, ios::binary);
+
+        size_t mapSize = index.size();
+        indexFile.write((char*)&mapSize, sizeof(mapSize));
+
+        for (const auto& kv : index) {
+            size_t keyLen = kv.first.size();
+            indexFile.write((char*)&keyLen, sizeof(keyLen));
+            indexFile.write(kv.first.c_str(), keyLen);
+
+            size_t setSize = kv.second.size();
+            indexFile.write((char*)&setSize, sizeof(setSize));
+
+            for (const auto& vp : kv.second) {
+                indexFile.write((char*)&vp.first, sizeof(vp.first));
+                indexFile.write((char*)&vp.second, sizeof(vp.second));
+            }
         }
+
+        indexFile.write((char*)&nextPos, sizeof(nextPos));
+        indexFile.close();
     }
 
 public:
-    FileDB() {}
+    FileDB() {
+        loadIndex();
+    }
 
     ~FileDB() {
-        closeDataFile();
+        saveIndex();
     }
 
-    void insert(const char* index, int value) {
-        openDataFile();
+    void insert(const char* idx, int value) {
+        string key(idx);
 
         // Check if entry already exists
-        dataFile.seekg(0, ios::beg);
-        Entry entry;
-        while (dataFile.read((char*)&entry, sizeof(Entry))) {
-            if (!entry.deleted && strcmp(entry.index, index) == 0 && entry.value == value) {
-                // Entry already exists, don't insert duplicate
-                closeDataFile();
-                return;
+        if (index.count(key) && index[key].count({value, -1})) {
+            // Find actual position
+            for (const auto& vp : index[key]) {
+                if (vp.first == value) {
+                    return; // Already exists
+                }
             }
         }
 
-        // Clear any error flags
-        dataFile.clear();
-
-        // Append new entry
-        dataFile.seekp(0, ios::end);
-        Entry newEntry(index, value);
-        dataFile.write((char*)&newEntry, sizeof(Entry));
-        dataFile.flush();
-
-        closeDataFile();
-    }
-
-    void remove(const char* index, int value) {
-        openDataFile();
-
-        dataFile.seekg(0, ios::beg);
-        Entry entry;
-        long pos = 0;
-
-        while (dataFile.read((char*)&entry, sizeof(Entry))) {
-            if (!entry.deleted && strcmp(entry.index, index) == 0 && entry.value == value) {
-                // Mark as deleted
-                entry.deleted = true;
-                dataFile.seekp(pos, ios::beg);
-                dataFile.write((char*)&entry, sizeof(Entry));
-                dataFile.flush();
-                closeDataFile();
-                return;
-            }
-            pos = dataFile.tellg();
+        // Append to data file
+        fstream dataFile(DATA_FILE, ios::in | ios::out | ios::binary | ios::app);
+        if (!dataFile.is_open()) {
+            dataFile.open(DATA_FILE, ios::out | ios::binary);
+            dataFile.close();
+            dataFile.open(DATA_FILE, ios::in | ios::out | ios::binary | ios::app);
         }
 
-        closeDataFile();
+        long pos = nextPos;
+        Entry entry(idx, value);
+        dataFile.write((char*)&entry, sizeof(Entry));
+        dataFile.close();
+
+        // Update index
+        index[key].insert({value, pos});
+        nextPos += sizeof(Entry);
     }
 
-    void find(const char* index) {
-        openDataFile();
+    void remove(const char* idx, int value) {
+        string key(idx);
+
+        if (!index.count(key)) {
+            return; // Key doesn't exist
+        }
+
+        // Find the entry in index
+        auto it = index[key].begin();
+        long posToDelete = -1;
+
+        for (auto& vp : index[key]) {
+            if (vp.first == value) {
+                posToDelete = vp.second;
+                break;
+            }
+        }
+
+        if (posToDelete == -1) {
+            return; // Entry doesn't exist
+        }
+
+        // Mark as deleted in file
+        fstream dataFile(DATA_FILE, ios::in | ios::out | ios::binary);
+        if (!dataFile.is_open()) {
+            return;
+        }
+
+        Entry entry;
+        dataFile.seekg(posToDelete, ios::beg);
+        dataFile.read((char*)&entry, sizeof(Entry));
+        entry.deleted = true;
+        dataFile.seekp(posToDelete, ios::beg);
+        dataFile.write((char*)&entry, sizeof(Entry));
+        dataFile.close();
+
+        // Remove from index
+        index[key].erase({value, posToDelete});
+        if (index[key].empty()) {
+            index.erase(key);
+        }
+    }
+
+    void find(const char* idx) {
+        string key(idx);
+
+        if (!index.count(key) || index[key].empty()) {
+            cout << "null" << endl;
+            return;
+        }
 
         vector<int> values;
-        dataFile.seekg(0, ios::beg);
-        Entry entry;
-
-        while (dataFile.read((char*)&entry, sizeof(Entry))) {
-            if (!entry.deleted && strcmp(entry.index, index) == 0) {
-                values.push_back(entry.value);
-            }
+        for (const auto& vp : index[key]) {
+            values.push_back(vp.first);
         }
 
-        closeDataFile();
+        sort(values.begin(), values.end());
 
-        if (values.empty()) {
-            cout << "null" << endl;
-        } else {
-            sort(values.begin(), values.end());
-            for (size_t i = 0; i < values.size(); i++) {
-                if (i > 0) cout << " ";
-                cout << values[i];
-            }
-            cout << endl;
+        for (size_t i = 0; i < values.size(); i++) {
+            if (i > 0) cout << " ";
+            cout << values[i];
         }
+        cout << endl;
     }
 };
 
