@@ -2,17 +2,32 @@
 #include <cstring>
 #include <vector>
 #include <algorithm>
+#include <set>
 
 using namespace std;
 
 const char* DATA_FILE = "database.dat";
 const int BUFFER_SIZE = 65536;
+const int CACHE_SIZE = 10000;
 
 struct Entry {
     char index[65];
     int value;
     bool deleted;
 };
+
+struct EntryKey {
+    char index[65];
+    int value;
+
+    bool operator<(const EntryKey& other) const {
+        int cmp = strcmp(index, other.index);
+        if (cmp != 0) return cmp < 0;
+        return value < other.value;
+    }
+};
+
+set<EntryKey> recentInserts;
 
 int main() {
     int n;
@@ -29,7 +44,17 @@ int main() {
             int val;
             scanf("%s%d", idx, &val);
 
-            // Check if exists
+            EntryKey key;
+            strncpy(key.index, idx, 64);
+            key.index[64] = 0;
+            key.value = val;
+
+            // Check recent inserts cache first
+            if (recentInserts.count(key)) {
+                continue; // Already exists
+            }
+
+            // Check file for duplicates only if not in cache
             bool exists = false;
             FILE* f = fopen(DATA_FILE, "rb");
             if (f) {
@@ -55,6 +80,12 @@ int main() {
                     fwrite(&newEntry, sizeof(Entry), 1, f);
                     fclose(f);
                 }
+
+                // Add to cache
+                recentInserts.insert(key);
+                if (recentInserts.size() > CACHE_SIZE) {
+                    recentInserts.erase(recentInserts.begin());
+                }
             }
         } else if (cmd[0] == 'd') { // delete
             char idx[65];
@@ -76,6 +107,13 @@ int main() {
                 }
                 fclose(f);
             }
+
+            // Remove from cache
+            EntryKey key;
+            strncpy(key.index, idx, 64);
+            key.index[64] = 0;
+            key.value = val;
+            recentInserts.erase(key);
         } else { // find
             char idx[65];
             scanf("%s", idx);
